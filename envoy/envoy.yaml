@@ -1,0 +1,110 @@
+admin:
+  access_log_path: "/tmp/admin_access.log"
+  address:
+    socket_address:
+      protocol: TCP
+      address: 0.0.0.0
+      port_value: 9901 # Admin console port of Envoy
+static_resources:
+  clusters:
+  - name: oauth_cluster
+    connect_timeout: 10s # defaults to 5s, so set it
+    type: strict_dns
+    dns_lookup_family: V4_ONLY
+    lb_policy: round_robin
+    load_assignment:
+      cluster_name: oauth_cluster
+      endpoints: 
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: <TLD>
+                    port_value: 443
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: <TLD>
+  # - name: target_app_server
+  #   connect_timeout: 10s # defaults to 5s, so set it
+  #   type: STRICT_DNS
+  #   lb_policy: round_robin
+  #   load_assignment:
+  #     cluster_name: target_app_server
+  #     endpoints: 
+  #       - lb_endpoints:
+  #         - endpoint:
+  #             address:
+  #               socket_address:
+  #                 protocol: TCP
+  #                 address: 127.0.0.1 # Internal application's hostname or IP address 
+  #                 port_value: 10170    # Internal application's port
+  listeners:
+  - address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10210 # Run envoy on this port 
+    filter_chains:
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: auto
+          route_config:
+            name: local_route_config
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]  # Wildcard for any domain (adjust for specificity)
+              routes:
+              - match: { path: "/status" }
+                direct_response: { status: 200, body: {inline_string: "OK"} }
+              - match: { path: "/api/tasks" }
+                direct_response: { status: 200, body: {inline_string: "OK"} }
+              # - match: 
+              #   prefix: "/api" # uncomment this, to route requests to actual target
+              #   route:
+              #     cluster: target_app_server
+          http_filters:
+          - name: envoy.filters.http.jwt_authn
+            typed_config:
+              '@type': type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+              providers:
+                tokenProvider:
+                  issuer: <TOKEN_ISSUER>
+                  remote_jwks:
+                    http_uri:
+                      uri: <TOKEN_ISSUER_JWKS>
+                      cluster: oauth_cluster
+                      timeout: 10s
+                    cache_duration:
+                      seconds: 86400
+                  forward: true
+                  payload_in_metadata: decodedJWTToken
+              rules:
+                - match:
+                    prefix: /api
+                  requires:
+                    provider_name: tokenProvider
+          - name: envoy.filters.http.golang
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.golang.v3alpha.Config
+              library_id: rate-limiter-v1
+              library_path: lib/rate-limiter.so
+              plugin_name: rate-limiter
+              plugin_config:
+                "@type": type.googleapis.com/xds.type.v3.TypedStruct
+                value:
+                  routeSpecificRateLimitConfig: |
+                     [ 
+                      {"key": "get--api/tasks--jwt.sub", "bucketSize": 1, "refillRateInSec": 1},
+                      {"key": "get--status", "bucketSize": 5, "refillRateInSec": 2} 
+                      ]
+                  redisConfig: |
+                    {
+                      "address" : "host.docker.internal:6379"
+                    }
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
